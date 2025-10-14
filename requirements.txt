@@ -1,0 +1,10 @@
+ultralytics
+opencv-python
+pyttsx3
+speechrecognition
+numpy
+Pillow
+pyaudio
+edge-tts
+pytesseract
+playsound
