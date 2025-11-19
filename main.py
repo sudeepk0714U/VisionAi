@@ -8,7 +8,42 @@ import numpy as np
 from ultralytics import YOLO
 from edge_tts import Communicate
 from playsound import playsound
-import time  # Added for calibration timestamp
+import time
+from dotenv import load_dotenv
+import openai
+from openai import OpenAI
+import base64
+from io import BytesIO
+import face_recognition
+import pickle
+from pathlib import Path
+import json
+from datetime import datetime
+
+load_dotenv()
+
+# --- NEW: Imports for Gemini API ---
+import google.generativeai as genai
+from PIL import Image
+
+# --- END NEW ---
+
+
+# --- OpenAI API Configuration ---
+try:
+    # IMPORTANT: Set your OPENAI_API_KEY as an environment variable
+    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable not set. Please set it to your API key.")
+
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    print("[INFO] OpenAI client initialized successfully.")
+
+except Exception as e:
+    print(f"[ERROR] Failed to initialize OpenAI API: {e}")
+    openai_client = None
+# --- END OpenAI API Configuration ---
+
 
 model = YOLO("yolov8n.pt")
 
@@ -32,7 +67,6 @@ high_priority_objects = {
 AUTO_WARNING_OBJECTS = {
     'car', 'truck', 'bus', 'motorcycle', 'bicycle',  # Vehicles
 }
-
 SAFETY_DISTANCES = {
     'car': 5.0,
     'truck': 6.0,
@@ -141,6 +175,209 @@ DEFAULT_OBJECT_INFO = {
     'max_width': 0.8,
     'height_ratio': 1.5
 }
+
+# Face recognition configuration
+FACE_ENCODINGS_PATH = Path("face_data/encodings.pkl")
+FACE_METADATA_PATH = Path("face_data/metadata.json")
+Path("face_data").mkdir(exist_ok=True)
+
+
+class FaceRecognitionSystem:
+    def __init__(self):
+        self.known_face_encodings = []
+        self.known_face_names = []
+        self.known_face_metadata = {}
+        self.face_detection_interval = 30  # Process face every 30 frames
+        self.frame_counter = 0
+        self.last_seen_faces = {}  # Track when faces were last seen
+        self.recognition_threshold = 0.6  # Distance threshold for face matching
+        self.pending_new_face = None  # Store pending face for naming
+        self.pending_new_encoding = None
+        self.last_alert_time = {}  # Track last alert time for each person
+        self.alert_cooldown = 60  # 60 seconds between alerts for same person
+
+        # Load existing face data
+        self.load_face_data()
+
+    def load_face_data(self):
+        """Load saved face encodings and metadata"""
+        try:
+            if FACE_ENCODINGS_PATH.exists():
+                with open(FACE_ENCODINGS_PATH, 'rb') as f:
+                    data = pickle.load(f)
+                    self.known_face_encodings = data.get('encodings', [])
+                    self.known_face_names = data.get('names', [])
+                print(f"[FACE] Loaded {len(self.known_face_names)} known faces")
+
+            if FACE_METADATA_PATH.exists():
+                with open(FACE_METADATA_PATH, 'r') as f:
+                    self.known_face_metadata = json.load(f)
+        except Exception as e:
+            print(f"[FACE ERROR] Failed to load face data: {e}")
+
+    def save_face_data(self):
+        """Save face encodings and metadata to disk"""
+        try:
+            # Save encodings
+            data = {
+                'encodings': self.known_face_encodings,
+                'names': self.known_face_names
+            }
+            with open(FACE_ENCODINGS_PATH, 'wb') as f:
+                pickle.dump(data, f)
+
+            # Save metadata
+            with open(FACE_METADATA_PATH, 'w') as f:
+                json.dump(self.known_face_metadata, f, indent=2)
+
+            print(f"[FACE] Saved {len(self.known_face_names)} face(s) to disk")
+        except Exception as e:
+            print(f"[FACE ERROR] Failed to save face data: {e}")
+
+    def process_frame(self, frame):
+        """Process frame for face recognition"""
+        self.frame_counter += 1
+
+        # Process every Nth frame for performance
+        if self.frame_counter % self.face_detection_interval != 0:
+            return []
+
+        # Resize frame for faster processing
+        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+        # Find all faces in the frame
+        face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
+        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+
+        face_results = []
+
+        for face_encoding, face_location in zip(face_encodings, face_locations):
+            # Scale back face locations
+            top, right, bottom, left = face_location
+            top *= 4
+            right *= 4
+            bottom *= 4
+            left *= 4
+
+            # Check if this is a known face
+            name, confidence = self.recognize_face(face_encoding)
+
+            if name == "Unknown":
+                # New face detected
+                face_results.append({
+                    'name': name,
+                    'confidence': confidence,
+                    'location': (top, right, bottom, left),
+                    'is_new': True,
+                    'encoding': face_encoding
+                })
+            else:
+                # Known face detected
+                self.update_last_seen(name)
+                face_results.append({
+                    'name': name,
+                    'confidence': confidence,
+                    'location': (top, right, bottom, left),
+                    'is_new': False,
+                    'encoding': None
+                })
+
+        return face_results
+
+    def recognize_face(self, face_encoding):
+        """Recognize a face from encoding"""
+        if len(self.known_face_encodings) == 0:
+            return "Unknown", 0.0
+
+        # Compare with known faces
+        face_distances = face_recognition.face_distance(self.known_face_encodings, face_encoding)
+        best_match_index = face_distances.argmin()
+        best_distance = face_distances[best_match_index]
+
+        # Calculate confidence (inverse of distance)
+        confidence = 1.0 - best_distance
+
+        if best_distance <= self.recognition_threshold:
+            name = self.known_face_names[best_match_index]
+            return name, confidence
+        else:
+            return "Unknown", confidence
+
+    def add_new_face(self, face_encoding, name):
+        """Add a new face to the database"""
+        if not name or name.strip() == "":
+            print("[FACE] Invalid name provided")
+            return False
+
+        name = name.strip()
+
+        # Check if name already exists
+        if name in self.known_face_names:
+            print(f"[FACE] Name '{name}' already exists")
+            return False
+
+        # Add to known faces
+        self.known_face_encodings.append(face_encoding)
+        self.known_face_names.append(name)
+
+        # Add metadata
+        self.known_face_metadata[name] = {
+            'added_date': datetime.now().isoformat(),
+            'first_seen': datetime.now().isoformat(),
+            'last_seen': datetime.now().isoformat(),
+            'times_seen': 1
+        }
+
+        # Save to disk
+        self.save_face_data()
+
+        print(f"[FACE] Added new face: {name}")
+        return True
+
+    def update_last_seen(self, name):
+        """Update the last seen timestamp for a face"""
+        if name in self.known_face_metadata:
+            current_time = datetime.now().isoformat()
+            self.known_face_metadata[name]['last_seen'] = current_time
+            self.known_face_metadata[name]['times_seen'] += 1
+            self.last_seen_faces[name] = current_time
+
+    def should_alert(self, name):
+        """Check if we should alert for this person"""
+        current_time = time.time()
+
+        if name not in self.last_alert_time:
+            self.last_alert_time[name] = current_time
+            return True
+
+        time_since_last_alert = current_time - self.last_alert_time[name]
+        if time_since_last_alert >= self.alert_cooldown:
+            self.last_alert_time[name] = current_time
+            return True
+
+        return False
+
+    def get_alert_message(self, name):
+        """Generate alert message for recognized face"""
+        if name in self.known_face_metadata:
+            metadata = self.known_face_metadata[name]
+            times_seen = metadata.get('times_seen', 1)
+            return f"Alert! {name} is in front of you. Seen {times_seen} times."
+        return f"Alert! {name} is in front of you."
+
+    def delete_face(self, name):
+        """Delete a face from the database"""
+        if name in self.known_face_names:
+            index = self.known_face_names.index(name)
+            self.known_face_names.pop(index)
+            self.known_face_encodings.pop(index)
+            if name in self.known_face_metadata:
+                del self.known_face_metadata[name]
+            self.save_face_data()
+            print(f"[FACE] Deleted face: {name}")
+            return True
+        return False
 
 
 class SafetyNavigationSystem:
@@ -464,74 +701,6 @@ class SafetyNavigationSystem:
         else:  # Object is to the left
             return "Obstacle to your left, move right"
 
-    # def detect_stairs(self, frame):
-    #     """Detect stairs using edge detection and line analysis"""
-    #     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    #
-    #     # Apply Gaussian blur to reduce noise
-    #     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    #     edges = cv2.Canny(blurred, 50, 150)
-    #
-    #     # Detect horizontal lines (potential stair edges)
-    #     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-    #                             minLineLength=120, maxLineGap=15)
-    #
-    #     if lines is None:
-    #         if self.debug_mode:
-    #             print("[DEBUG] No lines detected in stair detection")
-    #         return False
-
-        stair_lines = []
-        horizontal_lines = []
-
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-
-            # Check if line is roughly horizontal (more strict criteria)
-            if abs(y2 - y1) < 15 and abs(x2 - x1) > 80:
-                horizontal_lines.append(line[0])
-
-                # Check if this line could be part of a stair pattern
-                # Look for lines that are roughly parallel and evenly spaced
-                if len(horizontal_lines) > 1:
-                    # Check spacing between lines
-                    for prev_line in horizontal_lines[:-1]:
-                        prev_y = (prev_line[1] + prev_line[3]) / 2
-                        curr_y = (y1 + y2) / 2
-                        spacing = abs(curr_y - prev_y)
-
-                        # Stairs typically have consistent spacing between 20-80 pixels
-                        if 20 <= spacing <= 80:
-                            stair_lines.append(line[0])
-                            if self.debug_mode:
-                                print(f"[DEBUG] Stair line detected: spacing={spacing:.1f}px")
-                            break
-
-        # Require at least 3 well-spaced horizontal lines for stair detection
-        # Also check if lines are distributed across the frame height
-        if len(stair_lines) >= 3:
-            # Get the y-coordinates of detected lines
-            y_coords = []
-            for line in stair_lines:
-                y_coords.append((line[1] + line[3]) / 2)
-
-            y_coords.sort()
-
-            # Check if lines are distributed across the frame (not clustered)
-            total_height = self.frame_height
-            min_spacing = total_height / 6  # Lines should be spread across at least 1/6 of frame
-
-            if y_coords[-1] - y_coords[0] >= min_spacing:
-                if self.debug_mode:
-                    print(
-                        f"[DEBUG] STAIRS DETECTED: {len(stair_lines)} lines, height spread={y_coords[-1] - y_coords[0]:.1f}px")
-                return True
-
-        if self.debug_mode and len(horizontal_lines) > 0:
-            print(f"[DEBUG] Horizontal lines found: {len(horizontal_lines)}, but not enough for stairs")
-
-        return False
-
     def detect_crosswalk(self, frame):
         """Detect crosswalk using pattern recognition"""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -716,8 +885,9 @@ class SafetyNavigationSystem:
         return 0.0
 
 
-# Initialize safety navigation system
+# Initialize systems
 safety_system = SafetyNavigationSystem()
+face_system = FaceRecognitionSystem()
 
 # Shared variable for voice command
 last_command = ""
@@ -725,6 +895,7 @@ lock = threading.Lock()
 current_speech_rate = "+20%"  # Default speech rate
 voice_thread_running = False  # Track if voice thread is running
 last_safety_command_time = 0  # Track when safety command was last processed
+pending_face_name_input = False  # Flag for waiting for name input
 
 
 # Speech recognition thread
@@ -785,6 +956,68 @@ def speak(text, rate="+20%"):
     asyncio.run(speak_async(text, rate))
 
 
+# --- OpenAI Text Reading Function ---
+def read_text_with_openai(frame):
+    """
+    Uses OpenAI GPT-4 Vision to read text from a given camera frame.
+    """
+    if openai_client is None:
+        print("[ERROR] OpenAI client is not available. Check API key and initialization.")
+        return "Sorry, the text reading feature is currently unavailable."
+
+    try:
+        # Convert OpenCV's BGR image to RGB for processing
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_frame)
+
+        # Convert PIL image to base64 for OpenAI API
+        buffered = BytesIO()
+        pil_image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+        print("[OPENAI] Sending frame to OpenAI for text recognition...")
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an assistant for accessibility. Only transcribe visible text from the provided image. Do not identify, describe, or analyze any people, faces, or personal attributes. Do not provide opinions, descriptions, or summariesâ€”output text only. Donot reply with sorry i cant assist you.make sure you read the "
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Read the text which is available in the image ignore people and any other objects in the frame. JUST READ dont give any judgements and dont any dimension and other things only give text. if you find any sign boards please mention it also"
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=300
+        )
+
+        # Extract the response text
+        recognized_text = response.choices[0].message.content.strip()
+        print(f"[OPENAI] Recognized text: '{recognized_text}'")
+
+        if not recognized_text or "no text" in recognized_text.lower():
+            return "I don't see any text in front of you."
+
+        return f"{recognized_text}"
+
+    except Exception as e:
+        print(f"[OPENAI ERROR] An error occurred while processing the image: {e}")
+        return "Sorry, I encountered an error while trying to read the text."
+
+
 # Start webcam
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -795,9 +1028,8 @@ if not cap.isOpened():
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-print("[INFO] Smart AI Assistant with Safety Navigation Active")
+print("[INFO] Smart AI Assistant with Safety Navigation and Face Recognition Active")
 print("[INFO] Press 'q' to quit.")
-
 
 while True:
     ret, frame = cap.read()
@@ -810,9 +1042,7 @@ while True:
     safety_alerts = []
 
     # Detect stairs and crosswalks
-    # stairs_detected = safety_system.detect_stairs(frame)
     stairs_detected = False
-
     crosswalk_detected = safety_system.detect_crosswalk(frame)
 
     for box in results.boxes.data:
@@ -843,7 +1073,6 @@ while True:
                 safety_alerts.append(alert)
                 # Only speak critical warnings automatically for vehicles and persons
                 if is_dangerous and label in AUTO_WARNING_OBJECTS:
-                    # **NEW**: Get the direction and add it to the spoken alert
                     direction = safety_system.get_object_direction(relative_x)
                     speak(f"WARNING! {label} dangerously close, {direction}!", current_speech_rate)
 
@@ -857,6 +1086,39 @@ while True:
             cv2.line(frame, (int(x1 + object_width / 2), int(y2)),
                      (safety_system.center_x, safety_system.frame_height), (255, 255, 0), 1)
 
+    # Face recognition processing
+    face_results = face_system.process_frame(frame)
+
+    for face_info in face_results:
+        top, right, bottom, left = face_info['location']
+        name = face_info['name']
+        confidence = face_info['confidence']
+        is_new = face_info['is_new']
+
+        # Draw rectangle around face
+        if is_new:
+            color = (0, 165, 255)  # Orange for unknown
+            label_text = "Unknown - Say 'add face'"
+        else:
+            color = (0, 255, 0)  # Green for known
+            label_text = f"{name} ({confidence * 100:.1f}%)"
+
+        cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+        cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
+        cv2.putText(frame, label_text, (left + 6, bottom - 6),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, (255, 255, 255), 1)
+
+        # Store pending face for naming
+        if is_new and face_info['encoding'] is not None:
+            face_system.pending_new_face = face_info['location']
+            face_system.pending_new_encoding = face_info['encoding']
+
+        # Alert for recognized faces
+        if not is_new and name != "Unknown":
+            if face_system.should_alert(name):
+                alert_message = face_system.get_alert_message(name)
+                speak(alert_message, current_speech_rate)
+
     # Draw safety zone
     cv2.circle(frame, (safety_system.center_x, safety_system.frame_height),
                safety_system.danger_zone_radius, (0, 255, 255), 2)
@@ -867,7 +1129,6 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         stairs_alert = "Stairs detected ahead, be careful with elevation change"
         safety_alerts.append(stairs_alert)
-        # Re-enabled automatic stairs warning
         if safety_system.should_speak_alert(stairs_alert):
             speak(stairs_alert, current_speech_rate)
 
@@ -876,7 +1137,6 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
         crosswalk_alert = "Crosswalk detected, check for traffic signals"
         safety_alerts.append(crosswalk_alert)
-        # Automatic crosswalk warning remains OFF
 
     # Listen for voice command
     if not voice_thread_running:
@@ -885,21 +1145,66 @@ while True:
         voice_thread_running = True
         print("[VOICE] Voice recognition thread started")
 
-    # Process last command (The rest of your command processing logic remains unchanged)
+    # Process last command
     with lock:
         # Debug: Print the current command being processed
         if last_command:
             print(f"[DEBUG] Processing command: '{last_command}'")
 
-        if "what" in last_command and "front" in last_command:
+        # Face recognition commands
+        if "add" in last_command and "face" in last_command:
+            print("[DEBUG] 'add face' command detected")
+            if face_system.pending_new_encoding is not None:
+                speak("Please say the person's name", current_speech_rate)
+                pending_face_name_input = True
+                last_command = ""
+            else:
+                speak("No unknown face detected. Please wait for someone to appear.", current_speech_rate)
+                last_command = ""
+
+        # Handle name input when pending
+        elif pending_face_name_input and last_command:
+            print(f"[DEBUG] Name input: '{last_command}'")
+            # Use the voice command as the name
+            name = last_command.strip()
+
+            if face_system.add_new_face(face_system.pending_new_encoding, name):
+                speak(f"Successfully added {name} to the database", current_speech_rate)
+            else:
+                speak(f"Failed to add face. Name may already exist.", current_speech_rate)
+
+            # Reset pending state
+            pending_face_name_input = False
+            face_system.pending_new_face = None
+            face_system.pending_new_encoding = None
+            last_command = ""
+
+        # List known faces
+        elif "list" in last_command and "faces" in last_command:
+            print("[DEBUG] 'list faces' command detected")
+            if len(face_system.known_face_names) > 0:
+                names = ", ".join(face_system.known_face_names)
+                message = f"I know {len(face_system.known_face_names)} people: {names}"
+            else:
+                message = "I don't know anyone yet"
+            speak(message, current_speech_rate)
+            last_command = ""
+
+        # Delete face
+        elif "delete" in last_command and "face" in last_command:
+            print("[DEBUG] 'delete face' command detected")
+            speak("Say the name of the person to delete", current_speech_rate)
+            last_command = ""
+            # Wait for next command to get the name
+
+        # Regular object detection commands
+        elif "what" in last_command and "front" in last_command:
             print("[DEBUG] 'what front' command detected")
             if detected_objects:
-                # Enhanced response with directional information
                 message = "I see: " + ", ".join(
                     [
                         f"a {obj['label']} {safety_system.get_object_direction(obj['relative_x'])} about {obj['distance']:.1f} meters away"
                         for obj in detected_objects])
-
                 if any(obj['is_dangerous'] for obj in detected_objects):
                     message += ". WARNING: Some objects are dangerously close!"
             else:
@@ -914,12 +1219,11 @@ while True:
             last_command = ""
 
         elif "safety" in last_command or "danger" in last_command:
-            # Prevent safety command from being processed too frequently (within 2 seconds)
             current_time = time.time()
             if current_time - last_safety_command_time > 2.0:
                 print("[DEBUG] 'safety/danger' command detected")
                 if safety_alerts:
-                    message = "Safety alerts: " + ". ".join(safety_alerts[:1])  # Limit to 1 alert
+                    message = "Safety alerts: " + ". ".join(safety_alerts[:1])
                     print("[SAFETY]", message)
                     speak(message, current_speech_rate)
                 else:
@@ -929,6 +1233,13 @@ while True:
                 last_safety_command_time = current_time
             else:
                 print("[DEBUG] Safety command ignored - too frequent")
+            last_command = ""
+
+        elif "read" in last_command and "text" in last_command:
+            print("[DEBUG] 'read text' command detected")
+            speak("Looking for text...", current_speech_rate)
+            text_to_read = read_text_with_openai(frame)
+            speak(text_to_read, current_speech_rate)
             last_command = ""
 
         elif "path" in last_command or "route" in last_command:
@@ -969,11 +1280,10 @@ while True:
 
         elif "speed" in last_command and "up" in last_command:
             print("[DEBUG] 'speed up' command detected")
-            # Parse current rate and increase it
             try:
                 if current_speech_rate.startswith("+"):
                     current_rate = int(current_speech_rate[1:-1])
-                    new_rate = min(current_rate + 10, 100)  # Max 100%
+                    new_rate = min(current_rate + 10, 100)
                     current_speech_rate = f"+{new_rate}%"
                 else:
                     current_rate = int(current_speech_rate[1:-1])
@@ -989,15 +1299,14 @@ while True:
 
         elif "speed" in last_command and "down" in last_command:
             print("[DEBUG] 'speed down' command detected")
-            # Parse current rate and decrease it
             try:
                 if current_speech_rate.startswith("+"):
                     current_rate = int(current_speech_rate[1:-1])
-                    new_rate = max(current_rate - 10, 10)  # Min 10%
+                    new_rate = max(current_rate - 10, 10)
                     current_speech_rate = f"+{new_rate}%"
                 else:
                     current_rate = int(current_speech_rate[1:-1])
-                    new_rate = max(current_rate - 10, -50)  # Min -50%
+                    new_rate = max(current_rate - 10, -50)
                     current_speech_rate = f"{new_rate:+d}%"
                 print(f"[SPEECH] Speed decreased to {current_speech_rate}")
                 speak(f"Speech speed decreased to {current_speech_rate}", current_speech_rate)
@@ -1010,15 +1319,14 @@ while True:
         elif "auto" in last_command and "announce" in last_command:
             print("[DEBUG] 'auto announce' command detected")
             if "on" in last_command or "enable" in last_command:
-                safety_system.alert_cooldown = 3.0  # Enable automatic critical warnings
+                safety_system.alert_cooldown = 3.0
                 print("[AUTO] Automatic critical warnings enabled")
                 speak("Automatic critical warnings enabled", current_speech_rate)
             elif "off" in last_command or "disable" in last_command:
-                safety_system.alert_cooldown = 999999  # Disable automatic critical warnings
+                safety_system.alert_cooldown = 999999
                 print("[AUTO] Automatic critical warnings disabled")
                 speak("Automatic critical warnings disabled", current_speech_rate)
             else:
-                # Toggle automatic critical warnings
                 if safety_system.alert_cooldown > 1000:
                     safety_system.alert_cooldown = 3.0
                     print("[AUTO] Automatic critical warnings enabled")
@@ -1029,15 +1337,6 @@ while True:
                     speak("Automatic critical warnings disabled", current_speech_rate)
             last_command = ""
 
-        # If no command was processed, show available commands
-        elif last_command:
-            print(f"[DEBUG] Unrecognized command: '{last_command}'")
-            print(
-                "[DEBUG] Available commands: 'what front', 'safety', 'path', 'debug', 'fast speech', 'normal speech', 'slow speech', 'speed up', 'speed down', 'auto announce'")
-            # speak("Command not recognized. Try saying 'what front' or 'safety'", current_speech_rate)  # Removed to prevent speaking unrecognized commands
-            last_command = ""
-
-        # Test command to verify voice recognition
         elif "test" in last_command or "hello" in last_command:
             print("[DEBUG] 'test/hello' command detected")
             message = "Voice recognition is working! I can hear you clearly."
@@ -1045,9 +1344,13 @@ while True:
             speak(message, current_speech_rate)
             last_command = ""
 
+        elif last_command:
+            print(f"[DEBUG] Unrecognized command: '{last_command}'")
+            last_command = ""
+
     # Display safety information on screen
     y_offset = 110
-    for i, alert in enumerate(safety_alerts[:3]):  # Show top 3 alerts
+    for i, alert in enumerate(safety_alerts[:3]):
         cv2.putText(frame, alert[:50] + "...", (10, y_offset + i * 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
@@ -1068,13 +1371,19 @@ while True:
     cv2.putText(frame, voice_status, (10, y_offset + 160),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, voice_color, 2)
 
+    # Display face recognition status
+    face_count = len(face_system.known_face_names)
+    face_status = f"Known Faces: {face_count}"
+    cv2.putText(frame, face_status, (10, y_offset + 190),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+
     # Display available commands hint
-    commands_hint = "Say: 'test', 'what front', 'safety', 'debug'"
-    cv2.putText(frame, commands_hint, (10, y_offset + 190),
+    commands_hint = "Say: 'what front', 'add face', 'list faces'"
+    cv2.putText(frame, commands_hint, (10, y_offset + 220),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
     # Display
-    cv2.imshow("Smart AI Assistant - Safety Navigation", frame)
+    cv2.imshow("Smart AI Assistant - Safety Navigation + Face Recognition", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
