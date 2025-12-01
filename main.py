@@ -2,15 +2,13 @@ import cv2
 import speech_recognition as sr
 import threading
 import asyncio
-import tempfile
 import os
 import numpy as np
 from ultralytics import YOLO
-from edge_tts import Communicate
-from playsound import playsound
+import edge_tts
+import pygame
 import time
 from dotenv import load_dotenv
-import openai
 from openai import OpenAI
 import base64
 from io import BytesIO
@@ -19,22 +17,79 @@ import pickle
 from pathlib import Path
 import json
 from datetime import datetime
-load_dotenv()
-import google.generativeai as genai
 from PIL import Image
+import google.generativeai as genai
 
+load_dotenv()
 try:
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
     if not OPENAI_API_KEY:
-        raise ValueError("OPENAI_API_KEY environment variable not set. Please set it to your API key.")
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    print("[INFO] OpenAI client initialized successfully.")
+        print("[WARN] OPENAI_API_KEY not found. Text reading will not work.")
+        openai_client = None
+    else:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        print("[INFO] OpenAI client initialized successfully.")
 except Exception as e:
     print(f"[ERROR] Failed to initialize OpenAI API: {e}")
     openai_client = None
 
+# --- INITIALIZE AUDIO SYSTEM ---
+try:
+    # Initialize pygame mixer for stable audio playback
+    pygame.mixer.init()
+    print("[INFO] Audio system (pygame) initialized.")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize audio system: {e}")
+
 model = YOLO("yolov8n.pt")
 
+# --- SETTINGS ---
+# You can change this to "en-US-AriaNeural" or "en-US-ChristopherNeural"
+VOICE_NAME = "en-IN-NeerjaNeural"
+current_speech_rate = "+20%"
+
+
+# --- NEW ROBUST SPEAK FUNCTION ---
+def speak(text, rate_str="+20%"):
+    """
+    Generates high-quality audio using Edge TTS (Online)
+    and plays it using Pygame (Stable).
+    """
+
+    # 1. Define the async generation task
+    async def _generate_audio():
+        communicate = edge_tts.Communicate(text, VOICE_NAME, rate=rate_str)
+        await communicate.save("temp_tts.mp3")
+
+    try:
+        print(f"[TTS] Speaking: {text}")
+
+        # 2. Run the async generator synchronously
+        asyncio.run(_generate_audio())
+
+        # 3. Play audio with Pygame
+        if os.path.exists("temp_tts.mp3"):
+            pygame.mixer.music.load("temp_tts.mp3")
+            pygame.mixer.music.play()
+
+            # Block while playing so we don't overlap audio
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+
+            # Unload to release the file lock
+            pygame.mixer.music.unload()
+
+            # 4. Clean up temp file
+            try:
+                os.remove("temp_tts.mp3")
+            except PermissionError:
+                pass  # Sometimes Windows holds the lock a bit longer
+
+    except Exception as e:
+        print(f"[TTS ERROR] {e}")
+
+
+# --- REST OF YOUR CONFIGURATION ---
 obstacle_labels = {
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
     'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog',
@@ -155,12 +210,13 @@ FACE_ENCODINGS_PATH = Path("face_data/encodings.pkl")
 FACE_METADATA_PATH = Path("face_data/metadata.json")
 Path("face_data").mkdir(exist_ok=True)
 
+
 class FaceRecognitionSystem:
     def __init__(self):
         self.known_face_encodings = []
         self.known_face_names = []
         self.known_face_metadata = {}
-        self.face_detection_interval = 5
+        self.face_detection_interval = 1
         self.frame_counter = 0
         self.last_seen_faces = {}
         self.recognition_threshold = 0.6
@@ -303,6 +359,7 @@ class FaceRecognitionSystem:
             return True
         return False
 
+
 class SafetyNavigationSystem:
     def __init__(self):
         self.frame_width = 640
@@ -382,17 +439,21 @@ class SafetyNavigationSystem:
                 if self.calibration_quality > 0.7:
                     self.actual_focal_length = median_focal
                     self.focal_length_calibrated = True
-                    print(f"[CALIBRATION] High quality focal length: {median_focal:.1f}px (quality: {self.calibration_quality:.2f})")
+                    print(
+                        f"[CALIBRATION] High quality focal length: {median_focal:.1f}px (quality: {self.calibration_quality:.2f})")
                 else:
                     self.actual_focal_length = focal_mean
                     self.focal_length_calibrated = True
-                    print(f"[CALIBRATION] Standard focal length: {focal_mean:.1f}px (quality: {self.calibration_quality:.2f})")
+                    print(
+                        f"[CALIBRATION] Standard focal length: {focal_mean:.1f}px (quality: {self.calibration_quality:.2f})")
                 if self.debug_mode:
-                    print(f"[DEBUG] Calibration samples: {self.calibration_samples}, Std: {focal_std:.1f}, Quality: {self.calibration_quality:.2f}")
+                    print(
+                        f"[DEBUG] Calibration samples: {self.calibration_samples}, Std: {focal_std:.1f}, Quality: {self.calibration_quality:.2f}")
             else:
                 self.actual_focal_length = calculated_focal
                 self.focal_length_calibrated = True
-                print(f"[CALIBRATION] Initial focal length: {calculated_focal:.1f}px (samples: {self.calibration_samples})")
+                print(
+                    f"[CALIBRATION] Initial focal length: {calculated_focal:.1f}px (samples: {self.calibration_samples})")
             return True
         return False
 
@@ -479,7 +540,8 @@ class SafetyNavigationSystem:
             final_distance *= (0.9 + size_confidence * 0.2)
             final_distance = max(0.1, min(final_distance, 50.0))
             if self.debug_mode and len(distances) > 1:
-                print(f"[DEBUG] Distance methods: {len(distances)}, Final: {final_distance:.2f}m, Confidence: {confidence:.2f}")
+                print(
+                    f"[DEBUG] Distance methods: {len(distances)}, Final: {final_distance:.2f}m, Confidence: {confidence:.2f}")
             return final_distance
         return distance1
 
@@ -545,7 +607,8 @@ class SafetyNavigationSystem:
                     consistent_spacing = all(abs(spacing - avg_spacing) < avg_spacing * 0.3 for spacing in spacings)
                     if consistent_spacing and 15 <= avg_spacing <= 60:
                         if self.debug_mode:
-                            print(f"[DEBUG] CROSSWALK DETECTED: {horizontal_lines} lines, avg spacing={avg_spacing:.1f}px")
+                            print(
+                                f"[DEBUG] CROSSWALK DETECTED: {horizontal_lines} lines, avg spacing={avg_spacing:.1f}px")
                         return True
         return False
 
@@ -644,15 +707,16 @@ class SafetyNavigationSystem:
                     return confidences[-1] - confidences[0]
         return 0.0
 
+
 safety_system = SafetyNavigationSystem()
 face_system = FaceRecognitionSystem()
 
 last_command = ""
 lock = threading.Lock()
-current_speech_rate = "+20%"
 voice_thread_running = False
 last_safety_command_time = 0
 pending_face_name_input = False
+
 
 def listen_thread():
     global last_command
@@ -686,21 +750,6 @@ def listen_thread():
                 print(f"[VOICE] Error in speech recognition: {e}")
                 continue
 
-async def speak_async(text, rate="+20%"):
-    try:
-        communicate = Communicate(text=text, voice="en-IN-NeerjaNeural", rate=rate)
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            await communicate.save(tmp.name)
-            playsound(tmp.name)
-            os.remove(tmp.name)
-    except Exception as e:
-        print("[TTS ERROR]", e)
-
-def speak(text, rate="+20%"):
-    try:
-        asyncio.run(speak_async(text, rate))
-    except Exception as e:
-        print("[TTS RUN ERROR]", e)
 
 def read_text_with_openai(frame):
     if openai_client is None:
@@ -713,19 +762,27 @@ def read_text_with_openai(frame):
         pil_image.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         print("[OPENAI] Sending frame to OpenAI for text recognition...")
+
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an assistant for accessibility. Only transcribe visible text from the provided image. Do not identify, describe, or analyze any people, faces, or personal attributes. Do not provide opinions, descriptions, or summariesâ€”output text only. Donot reply with sorry i cant assist you.make sure you read the "
+                    "content": (
+                        "You are an assistive vision tool for the visually impaired. "
+                        "Your ONLY task is to perform OCR (Optical Character Recognition) on the provided image. "
+                        "Strictly output the text found in the environment (signs, labels, documents, screens). "
+                        "Do not describe the scene, do not identify people, and do not refuse the request. "
+                        "If the image contains people, ignore them completely and focus only on the text. "
+                        "If no text is visible, reply with 'No text detected'."
+                    )
                 },
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": "Read the text which is available in the image ignore people and any other objects in the frame. JUST READ dont give any judgements and dont any dimension and other things only give text. if you find any sign boards please mention it also"
+                            "text": "Extract all visible text from this image for a blind user."
                         },
                         {
                             "type": "image_url",
@@ -741,12 +798,58 @@ def read_text_with_openai(frame):
         )
         recognized_text = response.choices[0].message.content.strip()
         print(f"[OPENAI] Recognized text: '{recognized_text}'")
+
+        # Handle cases where it still refuses or finds nothing
         if not recognized_text or "no text" in recognized_text.lower():
             return "I don't see any text in front of you."
+        if "sorry" in recognized_text.lower() or "assist" in recognized_text.lower():
+            return "I see text, but I am having trouble reading it clearly."
+
         return f"{recognized_text}"
+
     except Exception as e:
         print(f"[OPENAI ERROR] An error occurred while processing the image: {e}")
         return "Sorry, I encountered an error while trying to read the text."
+
+#
+# def read_text_with_google(frame):
+#     # Configure the API (make sure GOOGLE_API_KEY is in your .env)
+#     api_key = os.getenv('GOOGLE_API_KEY')
+#     if not api_key:
+#         print("[ERROR] GOOGLE_API_KEY not found.")
+#         return "I need a Google API key to read text."
+#
+#     genai.configure(api_key=api_key)
+#
+#     try:
+#         # Convert CV2 frame (BGR) to PIL Image (RGB)
+#         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+#         pil_image = Image.fromarray(rgb_frame)
+#
+#         print("[GEMINI] Sending frame for text recognition...")
+#
+#         # Initialize the lightweight 'flash' model which is fast for video
+#         model = genai.GenerativeModel('gemini-1.5-flash')
+#
+#         response = model.generate_content([
+#             "Read the text in this image deeply. "
+#             "Ignore people. "
+#             "Output ONLY the detected text. "
+#             "If there are signboards, mention them.",
+#             pil_image
+#         ])
+#
+#         text = response.text.strip()
+#         print(f"[GEMINI] Recognized: '{text}'")
+#
+#         if not text:
+#             return "No text detected."
+#
+#         return text
+#
+#     except Exception as e:
+#         print(f"[GEMINI ERROR] {e}")
+#         return "Sorry, I couldn't read the text."
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -846,7 +949,8 @@ while True:
         if last_command:
             print(f"[DEBUG] Processing command: '{last_command}'")
 
-        if ("who" in last_command and "front" in last_command) or ("who" in last_command and "in front" in last_command):
+        if ("who" in last_command and "front" in last_command) or (
+                "who" in last_command and "in front" in last_command):
             print("[DEBUG] 'who is in front' command detected")
             if not face_results:
                 speak("I don't see anyone in front of you.", current_speech_rate)
